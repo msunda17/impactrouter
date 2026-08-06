@@ -170,10 +170,20 @@ See [`PRD.md`](./PRD.md) Sections 11–12 for the full methodology bar
 `docs/fm1_benchmark_writeup.md` for the actual written-up result once a real
 run has been completed.
 
+## Documentation
+
+| Document | What it's for |
+|---|---|
+| [`PRD.md`](./PRD.md) | Requirements SSOT — why ImpactRouter exists, goals, non-goals, milestones |
+| [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) | Implementation SSOT — module responsibilities, data flow, algorithms, diagrams |
+| [`docs/E2E_TESTING.md`](./docs/E2E_TESTING.md) | Copy-paste command reference for testing every layer, from unit tests to a full real-backend FM-1 run |
+| [`docs/fm1_benchmark_writeup.md`](./docs/fm1_benchmark_writeup.md) | The actual FM-1 result once a real benchmark has been run |
+
 ## Repository Layout
 
-See [`PRD.md`](./PRD.md) Section 9 for the canonical repository structure and
-Section 10 for the milestone-by-milestone build order this codebase follows.
+See [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) Section 14 for the
+canonical, up-to-date file map, and [`PRD.md`](./PRD.md) Section 10 for the
+milestone-by-milestone build order this codebase follows.
 
 ## Non-Goals
 

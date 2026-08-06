@@ -57,6 +57,11 @@ async def _fire_sibling(
         "model": model,
         "parent_context": parent_context,
         "stream": True,
+        # Dispatch-order index within this trial's fan-out (0-based). This is
+        # what lets bench/analyze_log.py classify cold-start vs. sibling
+        # requests by dispatch order rather than completion order -- the two
+        # can diverge under concurrent load (see models.py, ARCHITECTURE.md §9).
+        "sibling_index": role_index,
         "messages": [
             {"role": "system", "content": parent_context},
             {"role": "user", "content": role_instruction},

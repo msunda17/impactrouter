@@ -60,16 +60,22 @@ def test_health_check_failure_falls_back_without_corrupting_table_entry():
     )
 
     # First call: round-robins to b0 and stores it as sticky for hash_a.
+    # This is a TRUE cold start (parent_hash never seen before) -> affinity_miss_new.
     backend_first, outcome_first = router.select_backend("hash_a")
     assert backend_first == "b0"
     assert outcome_first == "affinity_miss_new"
     assert router.table["hash_a"].backend_id == "b0"
 
     # b0 is now unhealthy: request for hash_a should fall back to round-robin
-    # selection WITHOUT corrupting the sticky table entry for hash_a.
+    # selection WITHOUT corrupting the sticky table entry for hash_a. This is
+    # a DIFFERENT situation from a true cold start -- hash_a WAS seen before,
+    # its sticky backend is just transiently unhealthy -- so it gets its own
+    # distinct outcome, affinity_fallback_unhealthy, rather than being
+    # collapsed into affinity_miss_new (which would make it impossible to
+    # tell from the log alone whether a health blip occurred).
     backend_second, outcome_second = router.select_backend("hash_a")
     assert backend_second != "b0"
-    assert outcome_second == "affinity_miss_new"
+    assert outcome_second == "affinity_fallback_unhealthy"
     assert router.table["hash_a"].backend_id == "b0"  # untouched
 
     # Once b0 becomes healthy again, hash_a should resolve back to it.
@@ -77,6 +83,36 @@ def test_health_check_failure_falls_back_without_corrupting_table_entry():
     backend_third, outcome_third = router.select_backend("hash_a")
     assert backend_third == "b0"
     assert outcome_third == "affinity_hit"
+
+
+def test_new_parent_hash_is_distinct_from_unhealthy_sticky_fallback():
+    """A true cold start (affinity_miss_new) and a known parent_hash whose
+    sticky backend is currently unhealthy (affinity_fallback_unhealthy) must
+    produce two different outcome values, even though both round-robin to
+    pick a backend under the hood."""
+    unhealthy_backends = {"b0"}
+
+    def health_check(backend_id: str) -> bool:
+        return backend_id not in unhealthy_backends
+
+    router = AffinityRouter(
+        backends=["b0", "b1"], mode="affinity", health_check=health_check
+    )
+
+    # hash_new has never been seen -> true cold start, regardless of any
+    # backend's health.
+    _, outcome_new = router.select_backend("hash_new")
+    assert outcome_new == "affinity_miss_new"
+
+    # hash_a becomes sticky to a backend (b1, since b0 is unhealthy at
+    # round-robin time here -- doesn't matter which, just needs an entry).
+    router.select_backend("hash_a")
+    # Force hash_a's sticky backend to be the unhealthy one for this check:
+    router.table["hash_a"].backend_id = "b0"
+
+    _, outcome_known_but_unhealthy = router.select_backend("hash_a")
+    assert outcome_known_but_unhealthy == "affinity_fallback_unhealthy"
+    assert outcome_known_but_unhealthy != outcome_new
 
 
 def test_independent_hashes_do_not_interfere():

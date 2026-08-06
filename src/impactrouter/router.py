@@ -12,7 +12,12 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, Literal
 
-RoutingOutcome = Literal["affinity_hit", "affinity_miss_new", "control_round_robin"]
+RoutingOutcome = Literal[
+    "affinity_hit",
+    "affinity_miss_new",
+    "affinity_fallback_unhealthy",
+    "control_round_robin",
+]
 
 
 @dataclass
@@ -41,8 +46,17 @@ class AffinityRouter:
     def select_backend(self, parent_hash: str) -> tuple[str, RoutingOutcome]:
         """Returns (backend_id, routing_outcome).
 
-        routing_outcome is one of 'affinity_hit', 'affinity_miss_new',
-        'control_round_robin'.
+        routing_outcome is one of 'affinity_hit' (sticky backend used, was
+        already healthy), 'affinity_miss_new' (parent_hash never seen
+        before), 'affinity_fallback_unhealthy' (parent_hash WAS seen before,
+        but its sticky backend is currently unhealthy so this request
+        round-robins elsewhere without disturbing the table), or
+        'control_round_robin' (mode="round_robin", table never consulted).
+
+        These first three are distinguished deliberately: a true cold start
+        and a transient health-check fallback are different situations, and
+        collapsing them would make it impossible to tell from the log alone
+        whether a health blip occurred during a benchmark run.
         """
         if self.mode == "round_robin":
             backend = self._next_round_robin()
@@ -59,7 +73,7 @@ class AffinityRouter:
             # Sticky backend is unhealthy: fall back to round-robin for THIS
             # request without corrupting the table entry, so future healthy
             # retries can still resolve to the original sticky backend.
-            return backend, "affinity_miss_new"
+            return backend, "affinity_fallback_unhealthy"
 
         self.table[parent_hash] = RoutingEntry(
             parent_hash=parent_hash,

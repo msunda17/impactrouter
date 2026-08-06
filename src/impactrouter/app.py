@@ -124,10 +124,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
 
         # ImpactRouter's own fields are consumed here and not forwarded --
-        # the backend doesn't understand `parent_context`. Everything else
-        # (including fields this proxy doesn't explicitly model) passes
-        # through untouched, per PRD 7.1.
-        forward_body = chat_request.model_dump(exclude={"parent_context"}, exclude_none=True)
+        # the backend doesn't understand `parent_context` or `sibling_index`.
+        # Everything else (including fields this proxy doesn't explicitly
+        # model) passes through untouched, per PRD 7.1.
+        forward_body = chat_request.model_dump(
+            exclude={"parent_context", "sibling_index"}, exclude_none=True
+        )
 
         forward_headers = {
             k: v
@@ -148,6 +150,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 ttft_ms=result.ttft_ms,
                 total_latency_ms=result.total_latency_ms,
                 prompt_char_len=prompt_char_len,
+                sibling_index=chat_request.sibling_index,
             )
             await state.request_logger.log(entry)
 

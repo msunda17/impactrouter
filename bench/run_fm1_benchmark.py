@@ -3,14 +3,22 @@
 For each routing mode ("affinity", then "round_robin"), this script:
   1. Launches a fresh ImpactRouter proxy subprocess with IMPACTROUTER_MODE set
      accordingly and IMPACTROUTER_LOG_PATH pointed at a mode-specific JSONL file.
-  2. Waits for the proxy to report healthy.
-  3. Runs N trials (default 30, per PRD Section 11's minimum bar) of
+  2. Waits for the proxy to report healthy (shallow liveness check).
+  3. Probes every backend DIRECTLY (bypassing the proxy) with a real, minimal,
+     non-streaming completion request, and blocks until every backend
+     actually answers or a configurable timeout elapses. This is a distinct,
+     stronger check than step 2: a shallow `/health`-style liveness check can
+     report success while a real inference backend is still loading model
+     weights and cannot yet serve a generation request. Trials never start
+     against a backend that hasn't passed this probe -- see
+     ARCHITECTURE.md §6.4/§9 for the liveness-vs-readiness rationale.
+  4. Runs N trials (default 30, per PRD Section 11's minimum bar) of
      bench.simulate_siblings.simulate_sibling_fanout, each trial using a fresh
      idea_id so every trial gets a brand-new parent_hash (this matters: reusing
      an idea_id across trials would let a later trial's "first" request hit an
      already-warm routing-table entry from an earlier trial, corrupting the
      cold-start-vs-sibling split described in PRD Section 14).
-  4. Shuts the subprocess down cleanly.
+  5. Shuts the subprocess down cleanly.
 
 Run this against a REAL backend pool for a result that counts toward the PRD
 Section 11 acceptance bar. Running it against the bundled mock backend is
@@ -54,6 +62,76 @@ async def _wait_for_healthy(base_url: str, timeout_s: float = 30.0) -> None:
                 pass
             await asyncio.sleep(0.25)
     raise RuntimeError(f"Proxy at {base_url} did not become healthy within {timeout_s}s")
+
+
+def _parse_backend_list(raw: str) -> list[str]:
+    return [b.strip().rstrip("/") for b in raw.split(",") if b.strip()]
+
+
+async def _probe_backend_ready(
+    backend_url: str,
+    model: str,
+    timeout_s: float,
+    poll_interval_s: float = 2.0,
+) -> None:
+    """Blocks until `backend_url` can actually serve a real generation
+    request, or raises with a clear, specific error naming this backend if it
+    doesn't within `timeout_s`.
+
+    This is deliberately independent of whatever ImpactRouter's own
+    HealthChecker (health.py) reports: a shallow `/health`-style liveness
+    check can report success as soon as a server's HTTP listener is up, well
+    before a real inference engine (e.g. SGLang) has finished loading model
+    weights and can actually generate. Sending directly to the backend here
+    (bypassing the proxy entirely) confirms real request-serving readiness,
+    not just process liveness -- see ARCHITECTURE.md §6.4.
+
+    Note: SGLang exposes a deeper single-token-generation health check at
+    `/health_generate` (see ARCHITECTURE.md §6.4), which can be pointed at by
+    IMPACTROUTER_HEALTH_PATH if you want ImpactRouter's own HealthChecker to
+    use it too. This probe is the authoritative check regardless of that
+    configuration -- it doesn't rely on `/health_generate` existing or
+    behaving consistently across serving-engine versions.
+    """
+    deadline = time.monotonic() + timeout_s
+    body = {
+        "model": model,
+        "messages": [{"role": "user", "content": "readiness probe"}],
+        "max_tokens": 1,
+        "stream": False,
+    }
+    last_error = "no attempt made"
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        while time.monotonic() < deadline:
+            try:
+                resp = await client.post(f"{backend_url}/v1/chat/completions", json=body)
+                if resp.status_code == 200:
+                    return
+                last_error = f"HTTP {resp.status_code}: {resp.text[:200]!r}"
+            except httpx.HTTPError as exc:
+                last_error = f"{type(exc).__name__}: {exc}"
+            await asyncio.sleep(poll_interval_s)
+
+    raise RuntimeError(
+        f"Backend {backend_url!r} did not become ready to serve a real "
+        f"completion within {timeout_s:.0f}s (last error: {last_error}). "
+        "Refusing to start trials against a backend that may still be "
+        "loading -- increase --readiness-timeout-s if this backend is known "
+        "to take longer to load, or check the backend's own logs."
+    )
+
+
+async def _probe_all_backends_ready(
+    backends: list[str],
+    model: str,
+    timeout_s: float,
+    poll_interval_s: float = 2.0,
+) -> None:
+    """Probes every backend in the pool sequentially (not concurrently) so a
+    failure names exactly which backend didn't come up, rather than an
+    ambiguous "one of N backends" error."""
+    for backend_url in backends:
+        await _probe_backend_ready(backend_url, model, timeout_s, poll_interval_s)
 
 
 def _launch_proxy(
@@ -139,7 +217,17 @@ async def _run_mode(
     )
     try:
         await _wait_for_healthy(base_url, timeout_s=args.startup_timeout_s)
-        print(f"Proxy healthy. Running {args.trials} trials of {args.n_siblings}-way sibling fan-out...")
+        print("Proxy liveness OK. Probing backend(s) for real generation readiness "
+              f"(not just liveness) -- timeout {args.readiness_timeout_s:.0f}s per backend...")
+        backend_list = _parse_backend_list(args.backends)
+        await _probe_all_backends_ready(
+            backends=backend_list,
+            model=args.model,
+            timeout_s=args.readiness_timeout_s,
+            poll_interval_s=args.readiness_poll_interval_s,
+        )
+        print(f"All {len(backend_list)} backend(s) confirmed ready to generate.")
+        print(f"Running {args.trials} trials of {args.n_siblings}-way sibling fan-out...")
         await _run_trials(
             base_url=base_url,
             model=args.model,
@@ -166,7 +254,29 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--health-path", default="/health")
-    parser.add_argument("--startup-timeout-s", type=float, default=30.0)
+    parser.add_argument(
+        "--startup-timeout-s",
+        type=float,
+        default=30.0,
+        help="How long to wait for the proxy process itself to report /healthz liveness.",
+    )
+    parser.add_argument(
+        "--readiness-timeout-s",
+        type=float,
+        default=120.0,
+        help=(
+            "How long to wait, per backend, for a REAL completion request to succeed "
+            "before giving up. Distinct from --startup-timeout-s: a real inference "
+            "engine can take a couple of minutes to load model weights after its HTTP "
+            "server is already answering /health checks (default: 120s / 2 minutes)."
+        ),
+    )
+    parser.add_argument(
+        "--readiness-poll-interval-s",
+        type=float,
+        default=2.0,
+        help="Delay between readiness-probe retries against a single backend.",
+    )
     parser.add_argument(
         "--inter-trial-delay-s",
         type=float,

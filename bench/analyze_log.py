@@ -3,9 +3,11 @@
 
 Splits each log into "first" (cold-start, unavoidable cache miss regardless
 of routing mode) vs "sibling" (2nd, 3rd, ... request for the same parent)
-requests by grouping on `parent_hash` and ordering by timestamp -- see PRD
-Section 14's cold-start confound note. The FM-1 delta is computed on sibling
-requests only, since that's where affinity routing's advantage should show up.
+requests by grouping on `parent_hash` and classifying each group with
+`classify_cold_start_vs_sibling` -- see that function's docstring for why
+dispatch order (`sibling_index`), not completion timestamp, is the primary
+signal. The FM-1 delta is computed on sibling requests only, since that's
+where affinity routing's advantage should show up.
 
 Usage:
     python bench/analyze_log.py logs/fm1_affinity.jsonl logs/fm1_round_robin.jsonl
@@ -31,6 +33,39 @@ def load_jsonl(path: Path) -> list[dict]:
     return entries
 
 
+def classify_cold_start_vs_sibling(group: list[dict]) -> tuple[dict, list[dict]]:
+    """Given all log entries sharing one `parent_hash`, returns
+    `(cold_start_entry, sibling_entries)`.
+
+    Primary path -- used for anything produced by bench/run_fm1_benchmark.py:
+    if every entry in the group has `sibling_index` set, classify by that.
+    Index 0 is the cold start, every other index is a sibling. This is
+    dispatch-order, not completion-order, and that distinction matters:
+    `simulate_siblings.py` fires all siblings concurrently, and under
+    concurrent load completion order can legitimately differ from dispatch
+    order (e.g. in `affinity` mode, a warm sibling can finish its whole
+    response before the cold-start request finishes prefilling). Classifying
+    by completion timestamp instead of dispatch order can therefore mislabel
+    a genuinely-warm sibling as the cold start or vice versa, silently
+    corrupting the exact split the FM-1 measurement depends on.
+
+    Fallback path -- used only when `sibling_index` is missing on some or all
+    entries in the group (e.g. ad hoc Tier 2 manual `curl` testing, which
+    doesn't set it): sort by completion `timestamp` instead. Lower fidelity
+    under concurrency, but sufficient for a quick manual sanity check where
+    there's no real concurrent fan-out to mis-order in the first place.
+    """
+    if not group:
+        raise ValueError("classify_cold_start_vs_sibling() called with an empty group")
+
+    if all(e.get("sibling_index") is not None for e in group):
+        ordered = sorted(group, key=lambda e: e["sibling_index"])
+    else:
+        ordered = sorted(group, key=lambda e: e["timestamp"])
+
+    return ordered[0], ordered[1:]
+
+
 def split_first_vs_sibling(entries: list[dict]) -> tuple[list[dict], list[dict]]:
     by_parent: dict[str, list[dict]] = defaultdict(list)
     for e in entries:
@@ -39,9 +74,9 @@ def split_first_vs_sibling(entries: list[dict]) -> tuple[list[dict], list[dict]]
     first_entries: list[dict] = []
     sibling_entries: list[dict] = []
     for group in by_parent.values():
-        group.sort(key=lambda e: e["timestamp"])
-        first_entries.append(group[0])
-        sibling_entries.extend(group[1:])
+        cold_start, siblings = classify_cold_start_vs_sibling(group)
+        first_entries.append(cold_start)
+        sibling_entries.extend(siblings)
     return first_entries, sibling_entries
 
 

@@ -36,9 +36,23 @@ class ChatCompletionRequest(BaseModel):
     messages: list[Message]
     stream: bool = True
     parent_context: Optional[str] = None
+    # Dispatch-order index (0-based) assigned by the calling harness when it
+    # fans out N sibling requests from the same parent (see
+    # bench/simulate_siblings.py). Consumed by app.py and NOT forwarded to
+    # the backend, same as parent_context. This exists so
+    # bench/analyze_log.py can classify cold-start vs. sibling requests by
+    # dispatch order rather than completion timestamp, which is unsound
+    # under concurrent load (a warm sibling can legitimately finish before
+    # the cold-start request still prefilling) -- see ARCHITECTURE.md §9.
+    sibling_index: Optional[int] = None
 
 
-RoutingOutcome = Literal["affinity_hit", "affinity_miss_new", "control_round_robin"]
+RoutingOutcome = Literal[
+    "affinity_hit",
+    "affinity_miss_new",
+    "affinity_fallback_unhealthy",
+    "control_round_robin",
+]
 
 
 class RequestLogEntry(BaseModel):
@@ -57,7 +71,14 @@ class RequestLogEntry(BaseModel):
     routing_outcome: RoutingOutcome
     ttft_ms: Optional[float] = None
     total_latency_ms: float
+    # Character count (NOT token count) of the shared parent + final-turn
+    # content -- a cheap proxy for prefix size, not a tokenizer-accurate one.
     prompt_char_len: int
+    # Dispatch-order index of this request among its siblings, if the caller
+    # supplied one (see ChatCompletionRequest.sibling_index above). None for
+    # requests that didn't set it (e.g. ad hoc manual testing) -- in that
+    # case bench/analyze_log.py falls back to a timestamp-based split.
+    sibling_index: Optional[int] = None
 
 
 class BackendStats(BaseModel):
