@@ -47,9 +47,10 @@ Calling Harness → ImpactRouter (FastAPI) → { Backend 0, Backend 1, ..., Back
                      └─ TTFT Logger (JSONL)
 ```
 
-See [`PRD.md`](./PRD.md) Section 5 for the full diagram and Section 6 for the
-core mechanism design (fingerprinting, routing table, streaming proxy, health
-checks, logging schema).
+See [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) for the full system
+architecture (workflows, diagrams, ADRs, foundational knowledge markers), and
+[`PRD.md`](./PRD.md) Sections 5–6 for the product-spec diagram and core
+mechanism design.
 
 ## Requirements
 
